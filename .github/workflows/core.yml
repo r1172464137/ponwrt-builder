@@ -134,20 +134,20 @@ jobs:
           src=bin/targets/airoha/an7581/packages
           ls "$src" | grep -q -- "-$name\.apk$" || { echo "没找到版本为 $name 的 kmod，vermagic 没生效？" >&2; ls "$src" | head; exit 1; }
           test -s "$src/packages.adb" || { echo "缺少签名索引 packages.adb（APK_PRIVATE_KEY 没配？）" >&2; exit 1; }
-          mkdir -p "/mnt/out/$name"
-          cp -a "$src/." "/mnt/out/$name/"
+          mkdir -p "/mnt/build/out/$name"
+          cp -a "$src/." "/mnt/build/out/$name/"
           # 构建信息一起放进去：固件构建会照着 feeds.buildinfo 锁同样的 feeds 版本
-          cp bin/targets/airoha/an7581/*.buildinfo "/mnt/out/$name/" 2>/dev/null || true
-          tar -C /mnt/out -czf "/mnt/out/an7581-$name.tar.gz" "$name"
+          cp bin/targets/airoha/an7581/*.buildinfo "/mnt/build/out/$name/" 2>/dev/null || true
+          tar -C /mnt/build/out -czf "/mnt/build/out/an7581-$name.tar.gz" "$name"
           echo "name=$name" >>"$GITHUB_OUTPUT"
-          echo "kmod 目录：$name，$(ls "/mnt/out/$name" | grep -c '\.apk$') 个包" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "kmod 目录：$name，$(ls "/mnt/build/out/$name" | grep -c '\.apk$') 个包" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: 发到 Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view kmod >/dev/null 2>&1 || gh release create kmod --title 'kmod（内核模块）' --notes '每个内核版本一个 tarball；软件源见 https://github.com/${{ env.CORE_REPO }}' --prerelease
-          gh release upload kmod "/mnt/out/an7581-${{ steps.pack.outputs.name }}.tar.gz" --clobber
+          gh release upload kmod "/mnt/build/out/an7581-${{ steps.pack.outputs.name }}.tar.gz" --clobber
 
       - name: 推到 core 仓库（软件源）
         env:
@@ -162,7 +162,7 @@ jobs:
           cd /mnt/core
           mkdir -p "$CORE_PATH"
           rm -rf "$CORE_PATH/$NAME"
-          cp -a "/mnt/out/$NAME" "$CORE_PATH/$NAME"
+          cp -a "/mnt/build/out/$NAME" "$CORE_PATH/$NAME"
           jq -n --arg p "$SHA" --arg d "$PON" --arg n "$NAME" --arg t "$(date -u +%FT%TZ)" \
             '{ponwrt: $p, pon_drivers: $d, latest: $n, updated: $t}' >state.json
           python3 scripts/index.py
