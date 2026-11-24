@@ -5,7 +5,7 @@
 | 工作流 | 做什么 | 产物 |
 |---|---|---|
 | **Core** | 每天看一次上游，内核相关文件有变化就编：内核 + `CONFIG_ALL_KMODS=y` | Release `kmod` 里的 tarball；推送到 [ponwrt-core](https://github.com/r1172464137/ponwrt-core) 软件源（GitHub Pages） |
-| **Firmware** | 编 `nokia_xg-040g-md-ubi` 和 `-ubi-usb-sfp` 两个变体 | 固件 Release；固件里预置 ponwrt-core 软件源 |
+| **Firmware** | 编 `nokia_xg-040g-md-ubi` 和 `-ubi-usb-sfp` 两个变体，内置 LuCI 中文、[handoff](https://github.com/r1172464137/luci-app-handoff)、[nikki](https://github.com/nikkinikki-org/OpenWrt-nikki) | 固件 Release；固件里预置 ponwrt-core 软件源 |
 
 ## 为什么固件和 kmod 能分开编
 
