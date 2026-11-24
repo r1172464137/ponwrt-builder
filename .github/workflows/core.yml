@@ -1,0 +1,183 @@
+name: Core（内核 + 全部 kmod）
+run-name: Core ${{ inputs.ref || 'master' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: ponwrt 的分支或提交
+        default: master
+      force:
+        description: 上游内核没变也重编
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 20 * * *' # 北京时间每天 4 点看一次上游
+
+permissions:
+  contents: write
+
+concurrency:
+  group: core
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: pbs05/ponwrt
+  PON_DRIVERS: pbs05/openwrt-pon-drivers
+  CORE_REPO: r1172464137/ponwrt-core
+  CORE_PATH: snapshot/targets/airoha/an7581
+
+jobs:
+  check:
+    name: 上游有没有影响内核的变化
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.c.outputs.build }}
+      sha: ${{ steps.c.outputs.sha }}
+      pon: ${{ steps.c.outputs.pon }}
+    steps:
+      - id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref || 'master' }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          sha=$(gh api "repos/$UPSTREAM/commits/$REF" --jq .sha)
+          pon=$(gh api "repos/$PON_DRIVERS/commits?per_page=1" --jq '.[0].sha')
+          last=$(curl -fsSL "https://raw.githubusercontent.com/$CORE_REPO/main/state.json" 2>/dev/null || echo '{}')
+          lsha=$(jq -r '.ponwrt // empty' <<<"$last")
+          lpon=$(jq -r '.pon_drivers // empty' <<<"$last")
+          build=false why=
+          if [ "$FORCE" = true ]; then build=true why="手动强制"
+          elif [ -z "$lsha" ]; then build=true why="还没编过"
+          elif [ "$pon" != "$lpon" ]; then build=true why="PON 驱动 feed 有新提交"
+          elif [ "$sha" != "$lsha" ]; then
+            # 只有内核、内核模块、工具链相关的改动才需要重编 kmod；对比结果超过 300 个文件时 API 会截断，直接当作有变化
+            cmp=$(gh api "repos/$UPSTREAM/compare/$lsha...$sha")
+            n=$(jq '.files | length' <<<"$cmp")
+            if [ "$n" -ge 300 ] || jq -r '.files[].filename' <<<"$cmp" | grep -qE '^(target/linux/|include/kernel|package/kernel/|toolchain/|include/target\.mk)'; then
+              build=true why="上游 $lsha..$sha 改了内核相关文件"
+            fi
+          fi
+          echo "ponwrt $sha / pon-drivers $pon → build=$build ${why}" | tee -a "$GITHUB_STEP_SUMMARY"
+          { echo "build=$build"; echo "sha=$sha"; echo "pon=$pon"; } >>"$GITHUB_OUTPUT"
+
+  build:
+    name: 编译内核和全部 kmod
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾出磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo mkdir -p /mnt/build && sudo chown "$USER" /mnt/build
+          df -h / /mnt
+
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name: 拉 ponwrt ${{ needs.check.outputs.sha }}
+        run: |
+          git init -q /mnt/build/ponwrt && cd /mnt/build/ponwrt
+          git remote add origin "https://github.com/$UPSTREAM.git"
+          git fetch -q --depth 1 origin "${{ needs.check.outputs.sha }}"
+          git checkout -q FETCH_HEAD
+
+      - name: 下载缓存
+        uses: actions/cache@v4
+        with:
+          path: /mnt/build/ponwrt/dl
+          key: core-dl-${{ needs.check.outputs.sha }}
+          restore-keys: core-dl-
+
+      - name: 准备（feeds、固定 vermagic、配置）
+        working-directory: /mnt/build/ponwrt
+        env:
+          APK_PRIVATE_KEY: ${{ secrets.APK_PRIVATE_KEY }}
+        run: bash "$GITHUB_WORKSPACE/scripts/prepare.sh" core
+
+      - name: 下载源码包
+        working-directory: /mnt/build/ponwrt
+        run: make download -j"$(nproc)" || make download -j1 V=s
+
+      - name: 编译
+        working-directory: /mnt/build/ponwrt
+        # IGNORE_ERRORS：个别 kmod 编不过时跳过它，不让整次构建失败（官方 buildbot 也这么做）
+        run: |
+          make -j"$(nproc)" IGNORE_ERRORS='n m' || make -j1 V=s IGNORE_ERRORS='n m'
+
+      - name: 打包 kmod
+        id: pack
+        working-directory: /mnt/build/ponwrt
+        run: |
+          pv=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/airoha/Makefile)
+          kv=$pv$(sed -n "s/^LINUX_VERSION-$pv = //p" "target/linux/generic/kernel-$pv")
+          name="$kv~$(cat .vermagic)-r1"
+          src=bin/targets/airoha/an7581/packages
+          ls "$src" | grep -q -- "-$name\.apk$" || { echo "没找到版本为 $name 的 kmod，vermagic 没生效？" >&2; ls "$src" | head; exit 1; }
+          test -s "$src/packages.adb" || { echo "缺少签名索引 packages.adb（APK_PRIVATE_KEY 没配？）" >&2; exit 1; }
+          mkdir -p "/mnt/out/$name"
+          cp -a "$src/." "/mnt/out/$name/"
+          # 构建信息一起放进去：固件构建会照着 feeds.buildinfo 锁同样的 feeds 版本
+          cp bin/targets/airoha/an7581/*.buildinfo "/mnt/out/$name/" 2>/dev/null || true
+          tar -C /mnt/out -czf "/mnt/out/an7581-$name.tar.gz" "$name"
+          echo "name=$name" >>"$GITHUB_OUTPUT"
+          echo "kmod 目录：$name，$(ls "/mnt/out/$name" | grep -c '\.apk$') 个包" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 发到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view kmod >/dev/null 2>&1 || gh release create kmod --title 'kmod（内核模块）' --notes '每个内核版本一个 tarball；软件源见 https://github.com/${{ env.CORE_REPO }}' --prerelease
+          gh release upload kmod "/mnt/out/an7581-${{ steps.pack.outputs.name }}.tar.gz" --clobber
+
+      - name: 推到 core 仓库（软件源）
+        env:
+          DEPLOY_KEY: ${{ secrets.CORE_DEPLOY_KEY }}
+          NAME: ${{ steps.pack.outputs.name }}
+          SHA: ${{ needs.check.outputs.sha }}
+          PON: ${{ needs.check.outputs.pon }}
+        run: |
+          eval "$(ssh-agent -s)" >/dev/null
+          ssh-add - <<<"$DEPLOY_KEY" 2>/dev/null
+          git clone -q --depth 1 "git@github.com:$CORE_REPO.git" /mnt/core
+          cd /mnt/core
+          mkdir -p "$CORE_PATH"
+          rm -rf "$CORE_PATH/$NAME"
+          cp -a "/mnt/out/$NAME" "$CORE_PATH/$NAME"
+          jq -n --arg p "$SHA" --arg d "$PON" --arg n "$NAME" --arg t "$(date -u +%FT%TZ)" \
+            '{ponwrt: $p, pon_drivers: $d, latest: $n, updated: $t}' >state.json
+          python3 scripts/index.py
+          # 每次只保留一个提交：历史里堆二进制会让仓库越来越大；各内核版本的目录本身都保留
+          git checkout -q --orphan new
+          git add -A
+          git -c user.name=ponwrt-builder -c user.email=actions@github.com commit -qm "kmod $NAME（ponwrt ${SHA:0:10}）"
+          git push -q -f origin new:main
+          echo "软件源：https://${CORE_REPO%%/*}.github.io/${CORE_REPO#*/}/$CORE_PATH/$NAME/" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-logs
+          path: /mnt/build/ponwrt/logs
+          if-no-files-found: ignore
+          retention-days: 7
