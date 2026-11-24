@@ -1,0 +1,161 @@
+name: Firmware（XG-040G-MD 固件）
+run-name: Firmware ${{ inputs.tag || 'auto' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release 标签（留空自动用 日期-ponwrt提交）
+        default: ''
+  workflow_run:
+    workflows: ['Core（内核 + 全部 kmod）']
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmware
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: pbs05/ponwrt
+  CORE_REPO: r1172464137/ponwrt-core
+  CORE_URL: https://r1172464137.github.io/ponwrt-core
+  CORE_PATH: snapshot/targets/airoha/an7581
+
+jobs:
+  gate:
+    name: 要不要编
+    runs-on: ubuntu-24.04
+    outputs:
+      go: ${{ steps.g.outputs.go }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          # 手动触发就编；Core 跑完时，只有它真的编了新 kmod（上游内核有变化）才跟着编固件
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then go=true
+          else
+            c=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" --jq '.jobs[] | select(.name == "编译内核和全部 kmod") | .conclusion')
+            [ "$c" = success ] && go=true || go=false
+          fi
+          echo "go=$go" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: 编译 XG-040G-MD 固件
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读 core 仓库：用和最新 kmod 同一个 ponwrt 提交、同一套 feeds
+        id: core
+        run: |
+          state=$(curl -fsSL "https://raw.githubusercontent.com/$CORE_REPO/main/state.json")
+          sha=$(jq -r .ponwrt <<<"$state"); name=$(jq -r .latest <<<"$state")
+          [ -n "$sha" ] && [ "$sha" != null ] || { echo "core 仓库还没有 kmod，先跑 Core" >&2; exit 1; }
+          curl -fsSL "https://raw.githubusercontent.com/$CORE_REPO/main/$CORE_PATH/$name/feeds.buildinfo" >feeds.lock
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"; echo "name=$name" >>"$GITHUB_OUTPUT"
+          echo "ponwrt $sha，kmod 目录 $name" | tee -a "$GITHUB_STEP_SUMMARY"; cat feeds.lock
+
+      - name: 腾出磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo mkdir -p /mnt/build && sudo chown "$USER" /mnt/build
+
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name: 拉 ponwrt ${{ steps.core.outputs.sha }}
+        run: |
+          git init -q /mnt/build/ponwrt && cd /mnt/build/ponwrt
+          git remote add origin "https://github.com/$UPSTREAM.git"
+          git fetch -q --depth 1 origin "${{ steps.core.outputs.sha }}"
+          git checkout -q FETCH_HEAD
+          # feeds 锁到 Core 那次用的提交（feeds.buildinfo 就是带 ^提交 的 feeds.conf）
+          cp "$GITHUB_WORKSPACE/feeds.lock" feeds.conf
+
+      - name: 下载缓存
+        uses: actions/cache@v4
+        with:
+          path: /mnt/build/ponwrt/dl
+          key: fw-dl-${{ steps.core.outputs.sha }}
+          restore-keys: |
+            fw-dl-
+            core-dl-
+
+      - name: 准备（feeds、固定 vermagic、配置）
+        working-directory: /mnt/build/ponwrt
+        env:
+          APK_PRIVATE_KEY: ${{ secrets.APK_PRIVATE_KEY }}
+        run: bash "$GITHUB_WORKSPACE/scripts/prepare.sh" firmware
+
+      - name: 预置 kmod 软件源
+        working-directory: /mnt/build/ponwrt
+        env:
+          NAME: ${{ steps.core.outputs.name }}
+        run: |
+          pv=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/airoha/Makefile)
+          mine="$pv$(sed -n "s/^LINUX_VERSION-$pv = //p" "target/linux/generic/kernel-$pv")~$(cat .vermagic)-r1"
+          # 固件内核必须和 core 里的 kmod 是同一个，否则装不上：不一致直接失败
+          [ "$mine" = "$NAME" ] || { echo "固件内核 $mine 和 core 的 kmod $NAME 不一致" >&2; exit 1; }
+          mkdir -p files/etc/apk/repositories.d files/etc/apk/keys files/etc/uci-defaults
+          echo "$CORE_URL/$CORE_PATH/$NAME/packages.adb" >files/etc/apk/repositories.d/ponwrt-core.list
+          cp "$GITHUB_WORKSPACE/keys/ponwrt-builder.pem" files/etc/apk/keys/
+          # 官方源里 airoha 目标的 kmod 是别的 vermagic，装了也用不了：首次启动时去掉
+          cat >files/etc/uci-defaults/99-ponwrt-core <<'EOF'
+          sed -i '\#/targets/#d' /etc/apk/repositories.d/distfeeds.list 2>/dev/null
+          exit 0
+          EOF
+
+      - name: 下载源码包
+        working-directory: /mnt/build/ponwrt
+        run: make download -j"$(nproc)" || make download -j1 V=s
+
+      - name: 编译
+        working-directory: /mnt/build/ponwrt
+        run: make -j"$(nproc)" || make -j1 V=s
+
+      - name: 发布固件
+        working-directory: /mnt/build/ponwrt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.core.outputs.sha }}
+          NAME: ${{ steps.core.outputs.name }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          out=bin/targets/airoha/an7581
+          ls -la $out
+          tag=${TAG:-$(date -u +%Y%m%d)-${SHA:0:7}}
+          files=$(ls $out/*xg-040g-md* $out/sha256sums $out/*.buildinfo $out/*.manifest 2>/dev/null)
+          [ -n "$(ls $out/*xg-040g-md* 2>/dev/null)" ] || { echo "没找到 XG-040G-MD 的固件" >&2; exit 1; }
+          gh release create "$tag" $files -R "$GITHUB_REPOSITORY" --title "XG-040G-MD $tag" --prerelease --notes "ponwrt [\`${SHA:0:10}\`](https://github.com/$UPSTREAM/commit/$SHA)，内核 \`$NAME\`。
+          kmod 软件源已内置：$CORE_URL/$CORE_PATH/$NAME/ ，刷机后可直接 \`apk add kmod-xxx\`。"
+          echo "固件：https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-logs
+          path: /mnt/build/ponwrt/logs
+          if-no-files-found: ignore
+          retention-days: 7
