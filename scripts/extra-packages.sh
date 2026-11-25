@@ -16,6 +16,9 @@ clone eamonxg/luci-app-aurora-config luci-app-aurora-config
 t=$(mktemp -d)
 git clone -q --depth 1 https://github.com/rchen14b/luci-app-airoha-npu.git "$t"
 rm -rf package/luci-app-airoha-npu && mv "$t/luci-app-airoha-npu" package/ && rm -rf "$t"
+# 子目录那份是按放在 luci feed 里写的（include ../../luci.mk），放到 package/ 下要改成绝对路径
+sed -i 's|^include \.\./\.\./luci\.mk$|include $(TOPDIR)/feeds/luci/luci.mk|' package/luci-app-airoha-npu/Makefile
+grep -q '^include $(TOPDIR)/feeds/luci/luci.mk$' package/luci-app-airoha-npu/Makefile
 
 # 默认主题 shadcn：主题包各自的 uci-defaults 都会抢 mediaurlbase，这里最后执行，定为 shadcn
 mkdir -p files/etc/uci-defaults
