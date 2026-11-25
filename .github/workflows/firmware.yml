@@ -2,14 +2,18 @@ name: Firmware（XG-040G-MD 固件）
 run-name: Firmware ${{ inputs.tag || 'auto' }}
 
 on:
+  # Core 推送新 kmod 后会带参数触发；手动运行可以留空，自动用 core 仓库里最新的
   workflow_dispatch:
     inputs:
       tag:
         description: Release 标签（留空自动用 日期-ponwrt提交）
         default: ''
-  workflow_run:
-    workflows: ['Core（内核 + 全部 kmod）']
-    types: [completed]
+      name:
+        description: kmod 目录名（留空用 core 仓库 state.json 的 latest）
+        default: ''
+      sha:
+        description: ponwrt 提交（留空用 state.json 的）
+        default: ''
 
 permissions:
   contents: write
@@ -25,29 +29,8 @@ env:
   CORE_PATH: snapshot/targets/airoha/an7581
 
 jobs:
-  gate:
-    name: 要不要编
-    runs-on: ubuntu-24.04
-    outputs:
-      go: ${{ steps.g.outputs.go }}
-    steps:
-      - id: g
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-        run: |
-          # 手动触发就编；Core 跑完时，只有它真的编了新 kmod（上游内核有变化）才跟着编固件
-          if [ "${{ github.event_name }}" = workflow_dispatch ]; then go=true
-          else
-            c=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" --jq '.jobs[] | select(.name == "编译内核和全部 kmod") | .conclusion')
-            [ "$c" = success ] && go=true || go=false
-          fi
-          echo "go=$go" | tee -a "$GITHUB_OUTPUT"
-
   build:
     name: 编译 XG-040G-MD 固件
-    needs: gate
-    if: needs.gate.outputs.go == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -55,9 +38,15 @@ jobs:
 
       - name: 读 core 仓库：用和最新 kmod 同一个 ponwrt 提交、同一套 feeds
         id: core
+        env:
+          IN_NAME: ${{ inputs.name }}
+          IN_SHA: ${{ inputs.sha }}
         run: |
-          state=$(curl -fsSL "https://raw.githubusercontent.com/$CORE_REPO/main/state.json")
-          sha=$(jq -r .ponwrt <<<"$state"); name=$(jq -r .latest <<<"$state")
+          sha=$IN_SHA; name=$IN_NAME
+          if [ -z "$name" ]; then
+            state=$(curl -fsSL "https://raw.githubusercontent.com/$CORE_REPO/main/state.json")
+            sha=$(jq -r .ponwrt <<<"$state"); name=$(jq -r .latest <<<"$state")
+          fi
           [ -n "$sha" ] && [ "$sha" != null ] || { echo "core 仓库还没有 kmod，先跑 Core" >&2; exit 1; }
           curl -fsSL "https://raw.githubusercontent.com/$CORE_REPO/main/$CORE_PATH/$name/feeds.buildinfo" >feeds.lock
           echo "sha=$sha" >>"$GITHUB_OUTPUT"; echo "name=$name" >>"$GITHUB_OUTPUT"

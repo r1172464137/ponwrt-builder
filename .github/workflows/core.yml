@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  actions: write # 编完触发固件工作流
 
 concurrency:
   group: core
@@ -147,7 +148,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view kmod >/dev/null 2>&1 || gh release create kmod --title 'kmod（内核模块）' --notes '每个内核版本一个 tarball；软件源见 https://github.com/${{ env.CORE_REPO }}' --prerelease
-          gh release upload kmod "/mnt/build/out/an7581-${{ steps.pack.outputs.name }}.tar.gz" --clobber
+          # GitHub 会把附件名里的 ~ 换成 .，先改好名，--clobber 才能覆盖同名旧附件
+          n="${{ steps.pack.outputs.name }}"; f="/mnt/build/out/an7581-${n//\~/.}.tar.gz"
+          mv "/mnt/build/out/an7581-$n.tar.gz" "$f"
+          gh release upload kmod "$f" --clobber
 
       - name: 推到 core 仓库（软件源）
         env:
@@ -158,8 +162,8 @@ jobs:
         run: |
           eval "$(ssh-agent -s)" >/dev/null
           ssh-add - <<<"$DEPLOY_KEY" 2>/dev/null
-          git clone -q --depth 1 "git@github.com:$CORE_REPO.git" /mnt/core
-          cd /mnt/core
+          git clone -q --depth 1 "git@github.com:$CORE_REPO.git" /mnt/build/core
+          cd /mnt/build/core
           mkdir -p "$CORE_PATH"
           rm -rf "$CORE_PATH/$NAME"
           cp -a "/mnt/build/out/$NAME" "$CORE_PATH/$NAME"
@@ -172,6 +176,12 @@ jobs:
           git -c user.name=ponwrt-builder -c user.email=actions@github.com commit -qm "kmod $NAME（ponwrt ${SHA:0:10}）"
           git push -q -f origin new:main
           echo "软件源：https://${CORE_REPO%%/*}.github.io/${CORE_REPO#*/}/$CORE_PATH/$NAME/" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 接着编固件
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # 直接把这次的 kmod 目录和 ponwrt 提交传过去：刚推送完，raw 上的 state.json 可能还是缓存的旧版本
+        run: gh workflow run firmware.yml -R "$GITHUB_REPOSITORY" -f name="${{ steps.pack.outputs.name }}" -f sha="${{ needs.check.outputs.sha }}"
 
       - name: 失败时上传日志
         if: failure()

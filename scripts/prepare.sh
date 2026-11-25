@@ -28,8 +28,15 @@ CONFIG_TARGET_PER_DEVICE_ROOTFS=y
 CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_nokia_xg-040g-md-ubi=y
 CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_nokia_xg-040g-md-ubi-usb-sfp=y
 EOF
+# ponwrt 的配置是完整 .config，显式写了几百行「kmod-xxx is not set」，会压过 ALL_KMODS：core 模式先删掉
+[ "$MODE" = core ] && sed -i '/^# CONFIG_PACKAGE_kmod-.* is not set$/d' .config
 cat "$B/config/$MODE.config" >>.config
 make defconfig >/dev/null
+if [ "$MODE" = core ]; then
+	n=$(grep -c '^CONFIG_PACKAGE_kmod-.*=[ym]$' .config)
+	echo "选中 kmod：$n 个"
+	[ "$n" -gt 500 ] || { echo "kmod 选得太少，ALL_KMODS 没生效？" >&2; exit 1; }
+fi
 grep -q '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_nokia_xg-040g-md-ubi=y' .config || { echo "设备没选上" >&2; exit 1; }
 
 # apk 签名：和 ponwrt 一样放在源码根目录，构建时自动给索引签名
