@@ -81,9 +81,7 @@ jobs:
           git checkout -q FETCH_HEAD
           # feeds 锁到 Core 那次用的提交（feeds.buildinfo 就是带 ^提交 的 feeds.conf）
           cp "$GITHUB_WORKSPACE/feeds.lock" feeds.conf
-          # 固件额外带的插件：nikki 用它自己的 feed（不锁版本，跟最新），handoff 直接放进 package/
-          echo 'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' >>feeds.conf
-          git clone -q --depth 1 https://github.com/r1172464137/luci-app-handoff.git package/luci-app-handoff
+          bash "$GITHUB_WORKSPACE/scripts/extra-packages.sh"
 
       - name: 下载缓存
         uses: actions/cache@v4
@@ -101,7 +99,7 @@ jobs:
         run: |
           bash "$GITHUB_WORKSPACE/scripts/prepare.sh" firmware
           # defconfig 会悄悄丢掉找不到的包：额外插件没选上就直接失败
-          for p in luci-app-handoff luci-app-nikki nikki; do
+          for p in luci-app-handoff luci-app-iptv luci-app-upnp luci-app-airoha-npu luci-app-easytier easytier luci-theme-shadcn luci-theme-aurora luci-app-aurora-config; do
             grep -qx "CONFIG_PACKAGE_$p=y" .config || { echo "$p 没被选上（feed 或依赖有问题）" >&2; exit 1; }
           done
 
